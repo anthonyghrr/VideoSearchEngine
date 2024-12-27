@@ -1,10 +1,13 @@
 import os
 import cv2
 import json
+import re
 from rapidfuzz import fuzz
 from PIL import Image
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import WordCompleter
 import moondream as md
 
 try:
@@ -12,7 +15,11 @@ try:
 except ValueError as e:
     exit(1)
 
-# Function to detect scenes and save scene images
+# preprocess words
+def preprocess_word(word):
+    return re.sub(r'\W+', '', word.lower())
+
+#  detect scenes and save scene images
 def detect_scenes_and_save_images(video_path, output_folder="scenes"):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
@@ -49,6 +56,7 @@ def detect_scenes_and_save_images(video_path, output_folder="scenes"):
 
     return scene_images
 
+# generate captions for scene images
 def generate_captions_for_scenes(scene_images, captions_file="scene_captions.json"):
     if os.path.exists(captions_file):
         print("Loading captions from existing file...")
@@ -67,7 +75,7 @@ def generate_captions_for_scenes(scene_images, captions_file="scene_captions.jso
 
     return captions
 
-# Function to generate caption using moondream2
+#  generate caption using moondream2
 def generate_caption(image_path):
     print(f"Generating caption for {image_path} using moondream2...")
     image = Image.open(image_path)
@@ -75,18 +83,19 @@ def generate_caption(image_path):
     caption = model.caption(encoded_image)["caption"]
     return caption
 
-
+#  search scenes using normalized captions
 def search_scenes(captions, search_word):
+    search_word = preprocess_word(search_word)
     found_scenes = []
     for scene_num, caption in captions.items():
-        if search_word.lower() in caption.lower():
+        normalized_caption = " ".join(preprocess_word(word) for word in caption.split())
+        if search_word in normalized_caption:
             found_scenes.append(scene_num)
-        else:
-            if fuzz.partial_ratio(search_word.lower(), caption.lower()) > 70:
-                found_scenes.append(scene_num)
+        elif fuzz.partial_ratio(search_word, normalized_caption) > 70:
+            found_scenes.append(scene_num)
     return found_scenes
 
-
+#  create a collage of images
 def create_collage(image_paths, output_collage="collage.png"):
     images = [Image.open(image_path) for image_path in image_paths]
     num_images = len(images)
@@ -107,6 +116,15 @@ def create_collage(image_paths, output_collage="collage.png"):
     collage.save(output_collage)
     print(f"Collage saved to {output_collage}")
 
+    try:
+        if os.name == "posix":  # macOS/Linux
+            os.system(f"open {output_collage}")
+        elif os.name == "nt":  # Windows
+            os.startfile(output_collage)
+    except Exception as e:
+        print(f"Could not open collage: {e}")
+
+
 def main():
     video_path = "video.mp4"
     captions_file = "scene_captions.json"
@@ -115,16 +133,28 @@ def main():
     scene_images = detect_scenes_and_save_images(video_path)
 
     captions = generate_captions_for_scenes(scene_images, captions_file)
+    all_words = set()
+    for caption in captions.values():
+        words = caption.split()
+        normalized_words = [preprocess_word(word) for word in words]
+        all_words.update(normalized_words)
+    word_completer = WordCompleter(list(all_words), ignore_case=True)
+    session = PromptSession(completer=word_completer)
 
-    search_word = input("Search the video using a word: ").strip()
+    try:
+        search_word = session.prompt("Search the video using a word: ").strip()
 
-    found_scenes = search_scenes(captions, search_word)
-    if found_scenes:
-        print(f"Found {len(found_scenes)} scenes with the word '{search_word}':")
-        scene_images_to_collage = [os.path.join("scenes", f"scene_{scene}_start.jpg") for scene in found_scenes]
-        create_collage(scene_images_to_collage)
-    else:
-        print(f"No scenes found with the word '{search_word}'.")
+        found_scenes = search_scenes(captions, search_word)
+        if found_scenes:
+            print(f"Found {len(found_scenes)} scenes with the word '{search_word}':")
+            scene_images_to_collage = [os.path.join("scenes", f"scene_{scene}_start.jpg") for scene in found_scenes]
+            create_collage(scene_images_to_collage)
+        else:
+            print(f"No scenes found with the word '{search_word}'.")
+    except KeyboardInterrupt:
+        print("\nSearch interrupted.")
+    except EOFError:
+        print("\nSearch aborted.")
 
 if __name__ == "__main__":
     main()
