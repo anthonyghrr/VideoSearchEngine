@@ -3,23 +3,31 @@ import cv2
 import json
 import re
 from rapidfuzz import fuzz
+from dotenv import load_dotenv
 from PIL import Image
 from scenedetect import VideoManager, SceneManager
 from scenedetect.detectors import ContentDetector
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import WordCompleter
 import moondream as md
+import google.generativeai as genai
+import time
 
 try:
     model = md.vl(model="/Users/anthonyghandour/Desktop/moondream-2b-int8.mf")
 except ValueError as e:
     exit(1)
 
+# DOESNT WORK
+# load_dotenv()
+# genai.configure(api_key='GOOGLE_API_KEY')
+genai.configure(api_key='AIzaSyCptXoo8SdvDEzTW_d692hG3ZaM1KYBOBo')
+
 # preprocess words
 def preprocess_word(word):
     return re.sub(r'\W+', '', word.lower())
 
-#  detect scenes and save scene images
+# detect scenes and save scene images
 def detect_scenes_and_save_images(video_path, output_folder="scenes"):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
@@ -75,7 +83,7 @@ def generate_captions_for_scenes(scene_images, captions_file="scene_captions.jso
 
     return captions
 
-#  generate caption using moondream2
+# generate caption using moondream2
 def generate_caption(image_path):
     print(f"Generating caption for {image_path} using moondream2...")
     image = Image.open(image_path)
@@ -83,7 +91,7 @@ def generate_caption(image_path):
     caption = model.caption(encoded_image)["caption"]
     return caption
 
-#  search scenes using normalized captions
+# search scenes using normalized captions
 def search_scenes(captions, search_word):
     search_word = preprocess_word(search_word)
     found_scenes = []
@@ -95,7 +103,7 @@ def search_scenes(captions, search_word):
             found_scenes.append(scene_num)
     return found_scenes
 
-#  create a collage of images
+# create a collage of images
 def create_collage(image_paths, output_collage="collage.png"):
     images = [Image.open(image_path) for image_path in image_paths]
     num_images = len(images)
@@ -124,37 +132,104 @@ def create_collage(image_paths, output_collage="collage.png"):
     except Exception as e:
         print(f"Could not open collage: {e}")
 
+# Process video with Gemini model
+def process_video_with_gemini(video_path, search_word):
+    print("Uploading file...")
+    video_file = genai.upload_file(path=video_path)
+    print(f"Completed upload: {video_file.uri}")
+
+    while video_file.state.name == "PROCESSING":
+        print('.', end='')
+        time.sleep(10)
+        video_file = genai.get_file(video_file.name)
+
+    if video_file.state.name == "FAILED":
+        raise ValueError("Video upload failed.")
+
+    prompt = "Transcribe the audio from this video, giving timestamps for salient events in the video. Also provide visual descriptions."
+    model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+    print("Making LLM inference request...")
+    response = model.generate_content([video_file, prompt], request_options={"timeout": 600})
+    
+    print("Processing LLM response...")
+    response_text = response.text
+    frames_with_word = []
+    for line in response_text.split('\n'):
+        if search_word.lower() in line.lower():
+            timestamp_match = re.search(r'(\d{2}:\d{2}:\d{2})', line)
+            if timestamp_match:
+                timestamp = timestamp_match.group(1)
+                frames_with_word.append(timestamp)
+
+    if not frames_with_word:
+        print(f"No frames found with the word '{search_word}'.")
+        return
+
+    output_folder = "gemini_frames"
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    image_paths = []
+
+    for timestamp in frames_with_word:
+        h, m, s = map(int, timestamp.split(':'))
+        frame_number = int((h * 3600 + m * 60 + s) * fps)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+        ret, frame = cap.read()
+        if ret:
+            frame_filename = os.path.join(output_folder, f"frame_{timestamp.replace(':', '-')}.jpg")
+            cv2.imwrite(frame_filename, frame)
+            image_paths.append(frame_filename)
+
+    cap.release()
+
+    if image_paths:
+        create_collage(image_paths)
 
 def main():
     video_path = "video.mp4"
     captions_file = "scene_captions.json"
 
-    print("Processing the video and generating scene images...")
-    scene_images = detect_scenes_and_save_images(video_path)
+    print("Hello! I can help you find specific scenes in your video.")
+    user_choice = input("Would you like to search by images (1) or by video transcript (2)? Please type 1 or 2: ").strip()
+    
+    if user_choice == "1":
+        print("\nGreat! I'll start by detecting scenes in your video and generating captions for them.")
+        scene_images = detect_scenes_and_save_images(video_path)
+        captions = generate_captions_for_scenes(scene_images, captions_file)
 
-    captions = generate_captions_for_scenes(scene_images, captions_file)
-    all_words = set()
-    for caption in captions.values():
-        words = caption.split()
-        normalized_words = [preprocess_word(word) for word in words]
-        all_words.update(normalized_words)
-    word_completer = WordCompleter(list(all_words), ignore_case=True)
-    session = PromptSession(completer=word_completer)
+        all_words = set()
+        for caption in captions.values():
+            words = caption.split()
+            normalized_words = [preprocess_word(word) for word in words]
+            all_words.update(normalized_words)
+        word_completer = WordCompleter(list(all_words), ignore_case=True)
+        session = PromptSession(completer=word_completer)
 
-    try:
-        search_word = session.prompt("Search the video using a word: ").strip()
+        try:
+            print("\nNow, let's search for a specific word in the video.")
+            search_word = session.prompt("Please enter the word you'd like to search for: ").strip()
 
-        found_scenes = search_scenes(captions, search_word)
-        if found_scenes:
-            print(f"Found {len(found_scenes)} scenes with the word '{search_word}':")
-            scene_images_to_collage = [os.path.join("scenes", f"scene_{scene}_start.jpg") for scene in found_scenes]
-            create_collage(scene_images_to_collage)
-        else:
-            print(f"No scenes found with the word '{search_word}'.")
-    except KeyboardInterrupt:
-        print("\nSearch interrupted.")
-    except EOFError:
-        print("\nSearch aborted.")
+            found_scenes = search_scenes(captions, search_word)
+            if found_scenes:
+                print(f"Found {len(found_scenes)} scenes with the word '{search_word}':")
+                scene_images_to_collage = [os.path.join("scenes", f"scene_{scene}_start.jpg") for scene in found_scenes]
+                create_collage(scene_images_to_collage)
+            else:
+                print(f"Oops! I couldn't find any scenes with the word '{search_word}'.")
+        except KeyboardInterrupt:
+            print("\nNo worries, search interrupted. Feel free to try again!")
+        except EOFError:
+            print("\nSearch aborted. Let me know if you'd like to try something else.")
+    
+    elif user_choice == "2":
+        print("\nAwesome! I'll process the video and search for the word in the video transcript.")
+        search_word = input("What word would you like me to search for in the video? ").strip()
+        process_video_with_gemini(video_path, search_word)
+    else:
+        print("\nHmm, I didn't quite catch that. Please type 1 for images or 2 for the video model.")
+        print("No worries, I’ll be here to help when you're ready!")
 
 if __name__ == "__main__":
     main()
